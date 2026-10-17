@@ -62,6 +62,58 @@ class _SharedHeads(nn.Module):
         return self.n
 
 
+class _CPMixtureHead(nn.Module):
+    # Rank-R CP head for one level: q(x | h) = sum_r pi_r(h) prod_j softmax(head(h_j * (1 + g_r) + u_r))[x_j].
+    # pi_r reads the mean-pooled level states, which see only the prefix and coarser levels, so it never peeks at x.
+    # With rank 1, g = u = 0 and pi = 1, this is the base head exactly; for rank > 1 a small random g, u breaks the
+    # symmetry between components, which otherwise receive identical gradients forever.
+    def __init__(self, n_embd, rank, init_std=0.02):
+        super().__init__()
+        self.rank = int(rank)
+        assert self.rank >= 1, "cp_head.rank must be >= 1"
+        std = init_std if self.rank > 1 else 0.0
+        self.g = nn.Parameter(torch.randn(self.rank, n_embd) * std)
+        self.u = nn.Parameter(torch.randn(self.rank, n_embd) * std)
+        self.gate = nn.Linear(n_embd, self.rank)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.zeros_(self.gate.bias)
+
+    def log_pi(self, h):
+        return F.log_softmax(self.gate(h.mean(dim=1)).float(), dim=-1)
+
+    def component_logits(self, head, h, r):
+        # r: (B,) component per sequence -> (B, l, V)
+        return head(h * (1 + self.g[r][:, None, :]) + self.u[r][:, None, :])
+
+    def seq_log_prob(self, head, h, targets, mask=None):
+        # log q(targets | h) summed over the level's positions -> (B,); loops over r to keep one R-slice of logits live.
+        B, l = targets.shape
+        lp = []
+        for r in range(self.rank):
+            logits = head(h * (1 + self.g[r]) + self.u[r]).float()
+            tok = -F.cross_entropy(logits.reshape(B * l, -1), targets.reshape(-1), reduction='none').view(B, l)
+            if mask is not None:
+                tok = tok * mask
+            lp.append(tok.sum(dim=1))
+        log_pi = self.log_pi(h)
+        return torch.logsumexp(log_pi + torch.stack(lp, dim=1), dim=1), log_pi
+
+    @staticmethod
+    def balance_loss(log_pi):
+        # KL(batch-mean pi || uniform): 0 when the batch spreads over all components, log R when one takes over.
+        pi_bar = log_pi.exp().mean(dim=0)
+        return (pi_bar * (pi_bar.clamp(min=1e-12).log() + math.log(pi_bar.numel()))).sum()
+
+    def sample_component(self, h, temperature):
+        if self.rank == 1:
+            # no RNG draw, so rank 1 reproduces the base head's samples seed for seed
+            return torch.zeros(h.shape[0], dtype=torch.long, device=h.device)
+        log_pi = self.log_pi(h)
+        if temperature == 0:
+            return log_pi.argmax(dim=-1)
+        return torch.multinomial(F.softmax(log_pi / temperature, dim=-1), num_samples=1).squeeze(-1)
+
+
 class NextConceptTransformer(Transformer):
 
     def __init__(self,
@@ -236,6 +288,19 @@ class NextConceptTransformer(Transformer):
                 nn.Linear(n_embd, vs, bias=_hb) for vs in self.vocab_sizes
             ])
 
+        # cp_head: rank-R mixture of product distributions per level (see _CPMixtureHead); levels index lm_heads.
+        cp_cfg = getattr(config, 'cp_head', None)
+        self.cp_heads = nn.ModuleDict()
+        if cp_cfg is not None and bool(getattr(cp_cfg, 'enabled', False)):
+            _cp_levels = getattr(cp_cfg, 'levels', None)
+            _cp_levels = range(len(self.vocab_sizes)) if _cp_levels is None else [int(i) for i in _cp_levels]
+            for i in _cp_levels:
+                assert 0 <= i < len(self.vocab_sizes), f"cp_head level {i} out of range for {len(self.vocab_sizes)} heads"
+                assert not (self.l0_ar and i == 0), "cp_head cannot wrap the autoregressive level-0 head"
+                self.cp_heads[str(i)] = _CPMixtureHead(n_embd, int(getattr(cp_cfg, 'rank', 1)),
+                                                       init_std=float(getattr(cp_cfg, 'init_std', 0.02)))
+        self.cp_balance_weight = float(getattr(cp_cfg, 'balance_weight', 0.0)) if cp_cfg is not None else 0.0
+
         if self.query_level0:
             self.l0_queries = nn.Parameter(
                 torch.zeros(1, self.levels[0], self.vqvae_local[0].embed_dim))
@@ -373,7 +438,7 @@ class NextConceptTransformer(Transformer):
             h = block(h, attn_mask=ctx_mask, rope_cos_sin=rope_p)
         return self.ctx_ln(h)
 
-    def forward(self, x, prefix_ids=None, prefix_pad_mask=None):
+    def forward(self, x, prefix_ids=None, prefix_pad_mask=None, return_hidden=False):
         if self.use_ctx_encoder:
             assert prefix_ids is not None, "ctx_encoder requires prefix_ids"
             prefix_emb = self._encode_context(prefix_ids)
@@ -385,7 +450,7 @@ class NextConceptTransformer(Transformer):
                 x = x + self.wpe(self.wp_1L)
             if self.config.use_level_encoding:
                 x = x + self.transformer.wle(self.lvl_1L)
-            return self._run_stack(prefix_emb, x, prefix_pad_mask)
+            return self._run_stack(prefix_emb, x, prefix_pad_mask, return_hidden)
 
         z_prefix = x[:, :self.prefix_len, :]
         x_target = x[:, self.prefix_len:, :]
@@ -403,7 +468,7 @@ class NextConceptTransformer(Transformer):
         if self.config.use_level_encoding:
             x += self.transformer.wle(self.lvl_1L)
 
-        return self._run_stack(prefix_emb, x, prefix_pad_mask)
+        return self._run_stack(prefix_emb, x, prefix_pad_mask, return_hidden)
 
     def build_l0_query_input(self, batch_size, dtype=None):
         q = self.l0_queries.expand(batch_size, -1, -1)
@@ -434,7 +499,7 @@ class NextConceptTransformer(Transformer):
         pos = (last[:, None] - offs[None, :]).clamp(min=0, max=P - 1)
         return x.gather(1, pos[:, :, None].expand(-1, -1, x.shape[-1]))
 
-    def _run_stack(self, prefix_emb, x, prefix_pad_mask=None):
+    def _run_stack(self, prefix_emb, x, prefix_pad_mask=None, return_hidden=False):
         x = torch.cat([prefix_emb, x], dim=1)
 
         attn_mask = self.attn_mask_for_masking
@@ -451,8 +516,11 @@ class NextConceptTransformer(Transformer):
             for block in self.transformer.blocks:
                 x = block(x, attn_mask=attn_mask, rope_cos_sin=rope)
         x = self.transformer.ln_f(x)
+        if return_hidden:
+            return x
 
         x_target = x[:, self.prefix_len:, :]
+        # Levels with a cp head still emit the bare base-head logits here; train them through cp_loss.
         logits_list = []
         if self.predict_level0:
             l0_h = self._level0_slice(x, prefix_pad_mask)
@@ -462,6 +530,58 @@ class NextConceptTransformer(Transformer):
             logits_list.append(self._pad_vocab(self.lm_heads[i](x_target[:, offset:offset + level, :])))
             offset += level
         return torch.cat(logits_list, dim=1)
+
+    def cp_loss(self, x, targets, prefix_ids=None, prefix_pad_mask=None, target_mask=None):
+        # Exact NLL under the CP heads; targets (and target_mask) follow forward()'s logits layout, levels without a
+        # cp head fall back to per-position cross-entropy. Returns (loss per target token, sequence NLL (B,), balance).
+        h = self.forward(x, prefix_ids=prefix_ids, prefix_pad_mask=prefix_pad_mask, return_hidden=True)
+        h_target = h[:, self.prefix_len:, :]
+        tm = None if target_mask is None else target_mask.to(h.dtype)
+        seq_lp = h.new_zeros(targets.shape[0], dtype=torch.float32)
+        balance = h.new_zeros((), dtype=torch.float32)
+        offset = 0
+
+        def _ce(logits, tgt, m):
+            tok = -F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), tgt.reshape(-1),
+                                   reduction='none').view(tgt.shape)
+            return (tok if m is None else tok * m).sum(dim=1)
+
+        if self.predict_level0:
+            l0 = self.levels[0]
+            seq_lp = seq_lp + _ce(self.lm_head_l0(self._level0_slice(h, prefix_pad_mask)), targets[:, :l0],
+                                  None if tm is None else tm[:, :l0])
+            offset = l0
+        h_off = 0
+        for i, level in enumerate(self.levels[self._lvl_first:]):
+            hi = h_target[:, h_off:h_off + level, :]
+            tgt = targets[:, offset:offset + level]
+            m = None if tm is None else tm[:, offset:offset + level]
+            if str(i) in self.cp_heads:
+                lp, log_pi = self.cp_heads[str(i)].seq_log_prob(self.lm_heads[i], hi, tgt, m)
+                seq_lp = seq_lp + lp
+                balance = balance + _CPMixtureHead.balance_loss(log_pi)
+            else:
+                seq_lp = seq_lp + _ce(self.lm_heads[i](hi), tgt, m)
+            offset += level
+            h_off += level
+        n_tok = targets.numel() if tm is None else tm.sum().clamp(min=1)
+        loss = -seq_lp.sum() / n_tok + self.cp_balance_weight * balance
+        return loss, -seq_lp, balance
+
+    def _level_logits(self, hidx, h, temperature):
+        # Per-position logits for one level; a cp head first draws one component per sequence, so positions sampled
+        # in parallel from these logits are independent only given that component. Under CFG both halves reuse the
+        # conditional branch's component.
+        if str(hidx) not in self.cp_heads:
+            return self.lm_heads[hidx](h)
+        cp = self.cp_heads[str(hidx)]
+        _c = getattr(self, "_cfg", None)
+        if _c is not None and _c["scale"] > 0.0:
+            r = cp.sample_component(h[:_c["B"]], temperature)
+            r = torch.cat([r, r], dim=0)
+        else:
+            r = cp.sample_component(h, temperature)
+        return cp.component_logits(self.lm_heads[hidx], h, r)
 
 
     def _pad_vocab(self, logits):
@@ -498,7 +618,7 @@ class NextConceptTransformer(Transformer):
         logits_flat = torch.zeros_like(logits_flat).scatter_(-1, sorted_idx, sorted_logits)
         return torch.multinomial(F.softmax(logits_flat, dim=-1), num_samples=1).view(logits.shape[:-1])
 
-    def _decode_level_logits(self, x, prefix_emb, level_idx, pad_bias=None, hidx=None):
+    def _decode_level_logits(self, x, prefix_emb, level_idx, pad_bias=None, hidx=None, temperature=1.0):
         P = self.prefix_len
         hidx = level_idx if hidx is None else hidx
         L_cur = self.levels[level_idx + 1]
@@ -515,7 +635,7 @@ class NextConceptTransformer(Transformer):
         for block in self.transformer.blocks:
             x = block(x, attn_mask=gen_mask, rope_cos_sin=rope_k)
         x = self.transformer.ln_f(x)
-        return self.lm_heads[hidx](x[:, P:, :])
+        return self._level_logits(hidx, x[:, P:, :], temperature)
 
     @torch.no_grad()
     def generate(self, idx, prefix_tokens, temperature=1.0, top_k=50, top_p=0.9,
@@ -624,7 +744,7 @@ class NextConceptTransformer(Transformer):
                     h = block(h, attn_mask=m0, rope_cos_sin=rope_0)
                 h = self.transformer.ln_f(h)
                 if self._cfg is not None: self._cfg["level"] = 0
-                idx = self._sample_level(self.lm_heads[0](h[:, P:, :]), temperature, top_k, top_p)
+                idx = self._sample_level(self._level_logits(0, h[:, P:, :], temperature), temperature, top_k, top_p)
 
         if idx is None:
             assert self.predict_level0, "generate(idx=None) requires model.predict_level0 or query_level0"
@@ -684,10 +804,11 @@ class NextConceptTransformer(Transformer):
                     for block in self.transformer.blocks:
                         x = block(x, attn_mask=lvl_mask, rope_cos_sin=rope_k)
                     x = self.transformer.ln_f(x)
-                    logits = self.lm_heads[_hi](x)
+                    logits = self._level_logits(_hi, x, temperature)
                     idx_next = self._sample_level(logits, temperature, top_k, top_p)
                 else:
-                    logits = self._decode_level_logits(x, prefix_emb, level_idx, _pbias, hidx=_hi)
+                    logits = self._decode_level_logits(x, prefix_emb, level_idx, _pbias, hidx=_hi,
+                                                       temperature=temperature)
                     idx_next = self._sample_level(logits, temperature, top_k, top_p)
 
                 generated_idx.append(idx_next)

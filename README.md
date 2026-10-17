@@ -86,6 +86,22 @@ python evaluate.py --config config/eval/<dataset>.yaml --checkpoint-dir artifact
 
 This runs one generation shard per visible GPU, merges them, and prints ROUGE-1/2/L and generative perplexity for XSum; cased and lowercased sacreBLEU, chrF and length ratio for WMT14; solved, cell and valid-grid rates for Sudoku; and generative perplexity under GPT-2 large with unigram entropy, over 5 seeds of 256 unconditional samples, for TinyStories, OpenWebText and LM1B, the latter under the FLM scoring protocol. Add `--cfg <scale>` for classifier-free guidance on XSum and WMT14; the guided WMT14 row uses `--cfg 1.0`.
 
+## CP output head (experimental)
+
+Within a level, NCM samples every position independently, so each level's conditional is a product distribution (CP rank 1). Setting `model.cp_head` replaces it with a rank-R mixture of product distributions, `q(x | h) = sum_r pi_r prod_j p_{r,j}(x_j)`. Sampling first draws one component per sequence, then all positions in parallel, so it still costs one forward evaluation per level.
+
+```yaml
+model:
+  cp_head:
+    enabled: true
+    rank: 4             # R; rank 1 is the base head exactly
+    levels: [10, 11]    # lm_heads indices to wrap; omit for all levels
+    init_std: 0.02      # symmetry-breaking init for the component modulations
+    balance_weight: 0.01  # weight of KL(batch-mean pi || uniform) added by cp_loss
+```
+
+Train with `loss, seq_nll, balance = model.cp_loss(x, targets)`, where `targets` follows the layout of `forward()`'s logits. The released checkpoints carry no CP head and load unchanged.
+
 ## Repository layout
 
 - `evaluate.py`: evaluation entry point
