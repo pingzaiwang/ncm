@@ -88,7 +88,7 @@ This runs one generation shard per visible GPU, merges them, and prints ROUGE-1/
 
 ## CP output head (experimental)
 
-Within a level, NCM samples every position independently, so each level's conditional is a product distribution (CP rank 1). Setting `model.cp_head` replaces it with a rank-R mixture of product distributions, `q(x | h) = sum_r pi_r prod_j p_{r,j}(x_j)`. Sampling first draws one component per sequence, then all positions in parallel, so it still costs one forward evaluation per level.
+Within a level, NCM samples every position independently, so each level's conditional is a product distribution (CP rank 1). Setting `model.cp_head` replaces it with a rank-R mixture of product distributions, `q(x | h) = sum_r pi_r prod_j p_{r,j}(x_j)`. Sampling first draws one component per sequence, then all positions in parallel, so it still costs one forward evaluation per level. With `block_size: s` each block of `s` consecutive positions draws its own component, and blocks are independent given the coarser levels, so the level reaches rank `R^(l/s)` at the same sampling cost.
 
 ```yaml
 model:
@@ -96,6 +96,7 @@ model:
     enabled: true
     rank: 4             # R; rank 1 is the base head exactly
     levels: [10, 11]    # lm_heads indices to wrap; omit for all levels
+    block_size: 0       # one component per block of this many positions (0: one per level)
     init_std: 0.02      # symmetry-breaking init for the component modulations
     balance_weight: 0.01  # weight of KL(batch-mean pi || uniform) added by cp_loss
 ```

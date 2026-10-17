@@ -63,14 +63,18 @@ class _SharedHeads(nn.Module):
 
 
 class _CPMixtureHead(nn.Module):
-    # Rank-R CP head for one level: q(x | h) = sum_r pi_r(h) prod_j softmax(head(h_j * (1 + g_r) + u_r))[x_j].
-    # pi_r reads the mean-pooled level states, which see only the prefix and coarser levels, so it never peeks at x.
-    # With rank 1, g = u = 0 and pi = 1, this is the base head exactly; for rank > 1 a small random g, u breaks the
-    # symmetry between components, which otherwise receive identical gradients forever.
-    def __init__(self, n_embd, rank, init_std=0.02):
+    # Rank-R CP head for one level, applied per block of block_size consecutive positions (0: the whole level):
+    #   q(x | h) = prod_b sum_r pi_{b,r}(h) prod_{j in b} softmax(head(h_j * (1 + g_r) + u_r))[x_j].
+    # Blocks are independent given the coarser levels, so B blocks of rank R reach rank R^B over the level while
+    # sampling stays parallel. pi_b reads the mean-pooled block states, which see only the prefix and coarser levels,
+    # so it never peeks at x. With rank 1, g = u = 0 and pi = 1, this is the base head exactly; for rank > 1 a small
+    # random g, u breaks the symmetry between components, which otherwise receive identical gradients forever.
+    def __init__(self, n_embd, rank, init_std=0.02, block_size=0):
         super().__init__()
         self.rank = int(rank)
+        self.block_size = int(block_size)
         assert self.rank >= 1, "cp_head.rank must be >= 1"
+        assert self.block_size >= 0, "cp_head.block_size must be >= 0"
         std = init_std if self.rank > 1 else 0.0
         self.g = nn.Parameter(torch.randn(self.rank, n_embd) * std)
         self.u = nn.Parameter(torch.randn(self.rank, n_embd) * std)
@@ -78,40 +82,60 @@ class _CPMixtureHead(nn.Module):
         nn.init.zeros_(self.gate.weight)
         nn.init.zeros_(self.gate.bias)
 
+    def _blocks(self, l, device):
+        # position -> block id, and the number of blocks (the last one may be short)
+        bs = self.block_size if 0 < self.block_size < l else l
+        return torch.arange(l, device=device) // bs, -(-l // bs)
+
+    @staticmethod
+    def _block_sum(x, bid, nb):
+        # (B, l, ...) -> (B, nb, ...)
+        return x.new_zeros((x.shape[0], nb) + x.shape[2:]).index_add_(1, bid, x)
+
     def log_pi(self, h):
-        return F.log_softmax(self.gate(h.mean(dim=1)).float(), dim=-1)
+        # (B, l, d) -> (B, nb, R)
+        bid, nb = self._blocks(h.shape[1], h.device)
+        cnt = torch.bincount(bid, minlength=nb).to(h.dtype)
+        pooled = self._block_sum(h, bid, nb) / cnt[None, :, None]
+        return F.log_softmax(self.gate(pooled).float(), dim=-1)
 
     def component_logits(self, head, h, r):
-        # r: (B,) component per sequence -> (B, l, V)
-        return head(h * (1 + self.g[r][:, None, :]) + self.u[r][:, None, :])
+        # r: (B, nb) component per block -> (B, l, V)
+        bid, _ = self._blocks(h.shape[1], h.device)
+        r_pos = r[:, bid]
+        return head(h * (1 + self.g[r_pos]) + self.u[r_pos])
 
     def seq_log_prob(self, head, h, targets, mask=None):
         # log q(targets | h) summed over the level's positions -> (B,); loops over r to keep one R-slice of logits live.
         B, l = targets.shape
+        bid, nb = self._blocks(l, h.device)
         lp = []
         for r in range(self.rank):
             logits = head(h * (1 + self.g[r]) + self.u[r]).float()
             tok = -F.cross_entropy(logits.reshape(B * l, -1), targets.reshape(-1), reduction='none').view(B, l)
             if mask is not None:
                 tok = tok * mask
-            lp.append(tok.sum(dim=1))
+            lp.append(self._block_sum(tok, bid, nb))
         log_pi = self.log_pi(h)
-        return torch.logsumexp(log_pi + torch.stack(lp, dim=1), dim=1), log_pi
+        return torch.logsumexp(log_pi + torch.stack(lp, dim=-1), dim=-1).sum(dim=1), log_pi
 
     @staticmethod
     def balance_loss(log_pi):
-        # KL(batch-mean pi || uniform): 0 when the batch spreads over all components, log R when one takes over.
-        pi_bar = log_pi.exp().mean(dim=0)
+        # KL(mean pi over batch and blocks || uniform): 0 when components share the load, log R when one takes over.
+        pi_bar = log_pi.exp().reshape(-1, log_pi.shape[-1]).mean(dim=0)
         return (pi_bar * (pi_bar.clamp(min=1e-12).log() + math.log(pi_bar.numel()))).sum()
 
     def sample_component(self, h, temperature):
+        # -> (B, nb)
         if self.rank == 1:
             # no RNG draw, so rank 1 reproduces the base head's samples seed for seed
-            return torch.zeros(h.shape[0], dtype=torch.long, device=h.device)
+            _, nb = self._blocks(h.shape[1], h.device)
+            return torch.zeros(h.shape[0], nb, dtype=torch.long, device=h.device)
         log_pi = self.log_pi(h)
         if temperature == 0:
             return log_pi.argmax(dim=-1)
-        return torch.multinomial(F.softmax(log_pi / temperature, dim=-1), num_samples=1).squeeze(-1)
+        probs = F.softmax(log_pi / temperature, dim=-1)
+        return torch.multinomial(probs.reshape(-1, self.rank), num_samples=1).view(probs.shape[:-1])
 
 
 class NextConceptTransformer(Transformer):
@@ -298,7 +322,8 @@ class NextConceptTransformer(Transformer):
                 assert 0 <= i < len(self.vocab_sizes), f"cp_head level {i} out of range for {len(self.vocab_sizes)} heads"
                 assert not (self.l0_ar and i == 0), "cp_head cannot wrap the autoregressive level-0 head"
                 self.cp_heads[str(i)] = _CPMixtureHead(n_embd, int(getattr(cp_cfg, 'rank', 1)),
-                                                       init_std=float(getattr(cp_cfg, 'init_std', 0.02)))
+                                                       init_std=float(getattr(cp_cfg, 'init_std', 0.02)),
+                                                       block_size=int(getattr(cp_cfg, 'block_size', 0)))
         self.cp_balance_weight = float(getattr(cp_cfg, 'balance_weight', 0.0)) if cp_cfg is not None else 0.0
 
         if self.query_level0:
@@ -569,9 +594,9 @@ class NextConceptTransformer(Transformer):
         return loss, -seq_lp, balance
 
     def _level_logits(self, hidx, h, temperature):
-        # Per-position logits for one level; a cp head first draws one component per sequence, so positions sampled
-        # in parallel from these logits are independent only given that component. Under CFG both halves reuse the
-        # conditional branch's component.
+        # Per-position logits for one level; a cp head first draws one component per block, so positions sampled
+        # in parallel from these logits are independent only given those components. Under CFG both halves reuse the
+        # conditional branch's components.
         if str(hidx) not in self.cp_heads:
             return self.lm_heads[hidx](h)
         cp = self.cp_heads[str(hidx)]
