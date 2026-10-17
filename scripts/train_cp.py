@@ -6,7 +6,7 @@
 # The reported gain mixes two things: the CP modulations also recalibrate each position's marginal, which a rank-1
 # head (trained g, u, no mixture) does as well. Run --rank 1 as the control; gain(R) - gain(1) is what the mixture
 # itself buys, comparable to level_tc.py's TC.
-import argparse, os, sys
+import argparse, json, os, sys
 
 import torch
 from omegaconf import OmegaConf
@@ -101,6 +101,7 @@ def main():
             print(f"  step {step}/{a.steps}  loss/token {loss.item():.4f}  balance {bal.item():.4f}", flush=True)
         if a.eval_every and (step % a.eval_every == 0 or step == a.steps):
             report(f"step {step}", held_nll(net, tk, held, heads, a.bs), net)
+    final = held_nll(net, tk, held, heads, a.bs)
 
     os.makedirs(a.out_dir, exist_ok=True)
     # keep everything else the checkpoint carries (e.g. the level-0 unigram the eval config points into)
@@ -117,7 +118,11 @@ def main():
         if path and path != "generator.pt":
             out.generation[key] = os.path.abspath(os.path.join(ck, path)) + (":" + ref if ref else "")
     OmegaConf.save(out, os.path.join(a.out_dir, "config.yaml"))
-    print(f"[train_cp] wrote {a.out_dir}/generator.pt and config.yaml")
+    json.dump({"rank": a.rank, "block_size": a.block_size, "train_trunk": a.train_trunk,
+               "heads": {str(i): {"len": net.levels[i + net._lvl_first], "nll_product": p, "nll_cp": c}
+                         for i, (p, c) in final.items()}},
+              open(os.path.join(a.out_dir, "metrics.json"), "w"), indent=2)
+    print(f"[train_cp] wrote {a.out_dir}/generator.pt, config.yaml and metrics.json")
 
 
 if __name__ == "__main__":

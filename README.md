@@ -118,6 +118,15 @@ python scripts/train_cp.py --config config/eval/lm1b-small.yaml --checkpoint-dir
 python evaluate.py --config artifacts/lm1b/small-cp/config.yaml --checkpoint-dir artifacts/lm1b/small-cp
 ```
 
+`scripts/cp_sweep.py` chains the two: it estimates TC, keeps the `--top-k` levels whose TC exceeds twice its standard error, fits the rank-1 control and a `--ranks` x `--block-sizes` grid on them, and prints each fit's gain over the control next to the TC it could at most recover (`--evaluate` also scores every fit with `evaluate.py`). Finished steps are skipped on rerun.
+
+```bash
+python scripts/cp_sweep.py --config config/eval/lm1b-small.yaml --checkpoint-dir artifacts/lm1b/small \
+    --train train.txt --held valid.txt --ranks 2,4 --block-sizes 0,16 --out-dir sweeps/lm1b-small
+```
+
+`python tests/test_cp_head.py` checks the head on CPU without checkpoints: rank 1 reproduces the base head, the NLL matches brute force, the mixture learns a planted in-level dependence (per-block components where it is local), and the TC probe recovers a planted TC.
+
 ## Repository layout
 
 - `evaluate.py`: evaluation entry point
