@@ -102,6 +102,13 @@ model:
 
 Train with `loss, seq_nll, balance = model.cp_loss(x, targets)`, where `targets` follows the layout of `forward()`'s logits. The released checkpoints carry no CP head and load unchanged.
 
+To see which levels would gain, `scripts/level_tc.py` estimates each level's total correlation, the NLL that in-level independence gives up, from two causal probes on the frozen generator that differ only in reading the level's previous codes. Run it on held-out text from the generator's training distribution, not on its samples, which have zero TC by construction:
+
+```bash
+python scripts/level_tc.py --config config/eval/lm1b-small.yaml --checkpoint-dir artifacts/lm1b/small \
+    --train train.txt --held valid.txt --out eval/lm1b-small/tc.json
+```
+
 ## Repository layout
 
 - `evaluate.py`: evaluation entry point

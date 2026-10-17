@@ -637,6 +637,16 @@ class NextConceptTransformer(Transformer):
         x = self.transformer.ln_f(x)
         return self._level_logits(hidx, x[:, P:, :], temperature)
 
+    def embed_prefix(self, prefix_tokens):
+        # Prefix tokens -> the z-space prefix that forward() expects in x[:, :prefix_len] (no ctx_encoder).
+        if bool(getattr(self.config, 'raw_token_prefix', False)):
+            _enc = self.vqvae_local[0].encoder
+            if bool(getattr(self.config, 'contextual_prefix', False)) and \
+                    len(getattr(_enc, 'blocks', [])) > 0:
+                return _enc.forward_nopos(prefix_tokens)[:, :self.prefix_len, :]
+            return _enc.wte(prefix_tokens)[:, :self.prefix_len, :]
+        return self.vqvae_local[0].encode_z(prefix_tokens)[:, :self.prefix_len, :]
+
     @torch.no_grad()
     def generate(self, idx, prefix_tokens, temperature=1.0, top_k=50, top_p=0.9,
                  use_kv_cache=False, cfg_scale=0.0, cfg_null_eos=50256):
@@ -666,16 +676,7 @@ class NextConceptTransformer(Transformer):
         if self.use_ctx_encoder:
             prefix_emb = self._encode_context(prefix_tokens[:, :self.prefix_len])
         else:
-            if bool(getattr(self.config, 'raw_token_prefix', False)):
-                _enc = self.vqvae_local[0].encoder
-                if bool(getattr(self.config, 'contextual_prefix', False)) and \
-                        len(getattr(_enc, 'blocks', [])) > 0:
-                    z_prefix = _enc.forward_nopos(prefix_tokens)[:, :self.prefix_len, :]
-                else:
-                    z_prefix = _enc.wte(prefix_tokens)[:, :self.prefix_len, :]
-            else:
-                z_prefix = self.vqvae_local[0].encode_z(prefix_tokens)[:, :self.prefix_len, :]
-            prefix_emb = self.transformer.wte(z_prefix)
+            prefix_emb = self.transformer.wte(self.embed_prefix(prefix_tokens))
         if not self.use_rope:
             prefix_emb = prefix_emb + self.wpe(self.wp_prefix)
 
