@@ -110,6 +110,14 @@ python scripts/level_tc.py --config config/eval/lm1b-small.yaml --checkpoint-dir
     --train train.txt --held valid.txt --out eval/lm1b-small/tc.json
 ```
 
+`scripts/train_cp.py` then fits CP heads on chosen levels of a released generator (CP parameters only by default, `--train-trunk` to fine-tune the generator too), reports held-out NLL per level against the product head, and writes a `generator.pt` and `config.yaml` that `evaluate.py` runs directly. Run `--rank 1` as the control: it recalibrates the marginals without a mixture, so the gain over it is what the mixture buys.
+
+```bash
+python scripts/train_cp.py --config config/eval/lm1b-small.yaml --checkpoint-dir artifacts/lm1b/small \
+    --train train.txt --held valid.txt --levels 9,10 --rank 4 --block-size 16 --out-dir artifacts/lm1b/small-cp
+python evaluate.py --config artifacts/lm1b/small-cp/config.yaml --checkpoint-dir artifacts/lm1b/small-cp
+```
+
 ## Repository layout
 
 - `evaluate.py`: evaluation entry point

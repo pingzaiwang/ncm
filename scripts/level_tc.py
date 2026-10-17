@@ -65,10 +65,9 @@ def load_windows(path, tk):
     return torch.tensor(wins, dtype=torch.long)
 
 
-@torch.no_grad()
-def level_states(net, tk, tok):
-    # Teacher-forced generator states per head plus the true codes, laid out as forward() expects (unconditional:
-    # an EOS prefix, as in eval_shard.py).
+def teacher_inputs(net, tk, tok):
+    # Teacher-forced generator input, prefix pad mask and target codes, laid out as forward() expects
+    # (unconditional: an EOS prefix, as in eval_shard.py).
     vq, P = tk.vqvae.vq, net.prefix_len
     idx = tk.vqvae.encode(tok)
     B, l0 = idx.shape[0], vq.levels[0]
@@ -80,7 +79,14 @@ def level_states(net, tk, tok):
         tgt = idx[:, l0:]
     prefix = torch.full((B, P), tk.pre_tokenizer.eos_token_id, dtype=torch.long, device=tok.device)
     pm = (prefix == net.prefix_pad_id) if net.prefix_pad_id is not None else None
-    h = net(torch.cat([net.embed_prefix(prefix), xt], dim=1), prefix_pad_mask=pm, return_hidden=True)[:, P:]
+    return torch.cat([net.embed_prefix(prefix), xt], dim=1), pm, tgt
+
+
+@torch.no_grad()
+def level_states(net, tk, tok):
+    # Teacher-forced generator states and target codes, one (h, tgt) pair per head.
+    x, pm, tgt = teacher_inputs(net, tk, tok)
+    h = net(x, prefix_pad_mask=pm, return_hidden=True)[:, net.prefix_len:]
     out, off = [], 0
     for i, l in enumerate(net.levels[net._lvl_first:]):
         out.append((h[:, off:off + l], tgt[:, off:off + l]))
@@ -144,6 +150,31 @@ def estimate(net, tk, train, held, heads, steps=500, bs=16, lr=1e-3, width=256, 
     return rows
 
 
+def load_model(config, checkpoint_dir="", model_overrides=None):
+    # Tokenizer and generator as eval_shard.py builds them; model_overrides (e.g. a cp_head block) are merged into
+    # CFG.model, and only the parameters they add may be missing from the checkpoint.
+    from models.next_concept import NextConceptTransformer
+    from tokenization.vqvae_tokenizer import VQVAETokenizer
+
+    CFG = OmegaConf.load(config)
+    assert not (CFG.data and CFG.data.get(CFG.eval.get("split", "test"))), \
+        "only unconditional tasks are covered; conditional ones would need their source prefixes"
+    if model_overrides:
+        CFG.model = OmegaConf.merge(CFG.model, model_overrides)
+    ck = checkpoint_dir or os.path.join("artifacts", CFG.task)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    CFG.tokenizer.vqvae.checkpoint_path = os.path.join(ck, CFG.checkpoints.tokenizer)
+    tk = VQVAETokenizer.from_config(CFG.tokenizer)
+    tk.vqvae = tk.vqvae.to(dev).eval().requires_grad_(False)
+    net = NextConceptTransformer(vqvae_local=tk.vqvae, config=CFG.model).to(dev)
+    sd = torch.load(os.path.join(ck, CFG.checkpoints.generator), map_location="cpu", weights_only=False)
+    missing, unexpected = net.load_state_dict(sd["model"], strict=False)
+    assert not unexpected and all(k.startswith("cp_heads.") for k in missing), (missing, unexpected)
+    net.eval()
+    assert not net.use_ctx_encoder, "needs the z-space prefix path (no ctx_encoder)"
+    return CFG, ck, tk, net, sd
+
+
 def main():
     ap = argparse.ArgumentParser(description="estimate the per-level total correlation that parallel decoding drops")
     ap.add_argument("--config", required=True, help="eval config of an unconditional task, e.g. config/eval/lm1b-small.yaml")
@@ -163,22 +194,8 @@ def main():
     ap.add_argument("--out", default="", help="write the per-level rows as JSON here")
     a = ap.parse_args()
 
-    from models.next_concept import NextConceptTransformer
-    from tokenization.vqvae_tokenizer import VQVAETokenizer
-
-    CFG = OmegaConf.load(a.config)
-    assert not (CFG.data and CFG.data.get(CFG.eval.get("split", "test"))), \
-        "level_tc.py covers unconditional tasks; conditional ones would need their source prefixes"
-    ck = a.checkpoint_dir or os.path.join("artifacts", CFG.task)
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    CFG.tokenizer.vqvae.checkpoint_path = os.path.join(ck, CFG.checkpoints.tokenizer)
-    tk = VQVAETokenizer.from_config(CFG.tokenizer)
-    tk.vqvae = tk.vqvae.to(dev).eval()
-    net = NextConceptTransformer(vqvae_local=tk.vqvae, config=CFG.model).to(dev)
-    sd = torch.load(os.path.join(ck, CFG.checkpoints.generator), map_location="cpu", weights_only=False)
-    net.load_state_dict(sd["model"], strict=True)
-    net.eval().requires_grad_(False)
-    assert not net.use_ctx_encoder, "level_tc.py needs the z-space prefix path (no ctx_encoder)"
+    CFG, ck, tk, net, _ = load_model(a.config, a.checkpoint_dir)
+    net.requires_grad_(False)
 
     train, held = load_windows(a.train, tk), load_windows(a.held, tk)
     train = train[:a.n_train] if a.n_train else train
